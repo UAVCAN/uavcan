@@ -44,15 +44,17 @@ class SvcRequestTxSession final : public IRequestTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IRequestTxSession>, AnyFailure> make(TransportDelegate&     delegate,
-                                                                                  const RequestTxParams& params)
+    CETL_NODISCARD static Expected<UniquePtr<IRequestTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const RequestTxParams&      params)
     {
         if ((params.service_id > CANARD_SERVICE_ID_MAX) || (params.server_node_id > CANARD_NODE_ID_MAX))
         {
             return ArgumentError{};
         }
 
-        auto session = libcyphal::detail::makeUniquePtr<Spec>(delegate.memory(), Spec{}, delegate, params);
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params);
         if (session == nullptr)
         {
             return MemoryError{};
@@ -119,15 +121,17 @@ class SvcResponseTxSession final : public IResponseTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IResponseTxSession>, AnyFailure> make(TransportDelegate&      delegate,
-                                                                                   const ResponseTxParams& params)
+    CETL_NODISCARD static Expected<UniquePtr<IResponseTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const ResponseTxParams&     params)
     {
         if (params.service_id > CANARD_SERVICE_ID_MAX)
         {
             return ArgumentError{};
         }
 
-        auto session = libcyphal::detail::makeUniquePtr<Spec>(delegate.memory(), Spec{}, delegate, params);
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params);
         if (session == nullptr)
         {
             return MemoryError{};

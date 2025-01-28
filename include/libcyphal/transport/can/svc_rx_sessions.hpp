@@ -10,8 +10,8 @@
 
 #include "libcyphal/errors.hpp"
 #include "libcyphal/transport/errors.hpp"
+#include "libcyphal/transport/svc_rx_session_base.hpp"
 #include "libcyphal/transport/svc_sessions.hpp"
-#include "libcyphal/transport/types.hpp"
 #include "libcyphal/types.hpp"
 
 #include <canard.h>
@@ -19,8 +19,6 @@
 #include <cetl/pf17/cetlpf.hpp>
 
 #include <chrono>
-#include <cstdint>
-#include <utility>
 
 namespace libcyphal
 {
@@ -35,21 +33,15 @@ namespace can
 namespace detail
 {
 
-/// @brief A template class to represent a service request/response RX session (both for server and client sides).
+/// @brief A concrete class to represent a service request RX session (aka server side).
 ///
-/// @tparam Interface_ Type of the session interface.
-///                    Could be either `IRequestRxSession` or `IResponseRxSession`.
-/// @tparam Params Type of the session parameters.
-///                Could be either `RequestRxParams` or `ResponseRxParams`.
-/// @tparam TransferKind Kind of the service transfer.
-///                      Could be either `CanardTransferKindRequest` or `CanardTransferKindResponse`.
-///
-template <typename Interface_, typename Params, CanardTransferKind TransferKind>
-class SvcRxSession final : private IRxSessionDelegate, public Interface_
+class SvcRequestRxSession final
+    : public transport::detail::  //
+      SvcRxSessionBase<IRequestRxSession, IRxSessionDelegate, TransportDelegate, RequestRxParams, CanardMemory>
 {
     /// @brief Defines private specification for making interface unique ptr.
     ///
-    struct Spec : libcyphal::detail::UniquePtrSpec<Interface_, SvcRxSession>
+    struct Spec : libcyphal::detail::UniquePtrSpec<IRequestRxSession, SvcRequestRxSession>
     {
         // `explicit` here is in use to disable public construction of derived private `Spec` structs.
         // See https://seanmiddleditch.github.io/enabling-make-unique-with-private-constructors/
@@ -57,15 +49,17 @@ class SvcRxSession final : private IRxSessionDelegate, public Interface_
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<Interface_>, AnyFailure> make(TransportDelegate& delegate,
-                                                                           const Params&      params)
+    CETL_NODISCARD static Expected<UniquePtr<IRequestRxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const RequestRxParams&      params)
     {
         if (params.service_id > CANARD_SERVICE_ID_MAX)
         {
             return ArgumentError{};
         }
 
-        auto session = libcyphal::detail::makeUniquePtr<Spec>(delegate.memory(), Spec{}, delegate, params);
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params);
         if (session == nullptr)
         {
             return MemoryError{};
@@ -74,65 +68,31 @@ public:
         return session;
     }
 
-    SvcRxSession(const Spec, TransportDelegate& delegate, const Params& params)
-        : delegate_{delegate}
-        , params_{params}
+    SvcRequestRxSession(const Spec, TransportDelegate& delegate, const RequestRxParams& params)
+        : Base{delegate, params}
         , subscription_{}
     {
-        const std::int8_t result = ::canardRxSubscribe(&delegate.canardInstance(),
-                                                       TransferKind,
-                                                       params_.service_id,
-                                                       params_.extent_bytes,
-                                                       CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
-                                                       &subscription_);
-        (void) result;
-        CETL_DEBUG_ASSERT(result >= 0, "There is no way currently to get an error here.");
-        CETL_DEBUG_ASSERT(result > 0, "New subscription supposed to be made.");
+        delegate.listenForRxSubscription(subscription_, params);
 
         // No Sonar `cpp:S5356` b/c we integrate here with C libcanard API.
         subscription_.user_reference = static_cast<IRxSessionDelegate*>(this);  // NOSONAR cpp:S5356
 
-        delegate_.onSessionEvent(TransportDelegate::SessionEvent::SvcRxLifetime{true /* is_added */});
+        delegate.onSessionEvent(TransportDelegate::SessionEvent::SvcRequestCreated{});
     }
 
-    SvcRxSession(const SvcRxSession&)                = delete;
-    SvcRxSession(SvcRxSession&&) noexcept            = delete;
-    SvcRxSession& operator=(const SvcRxSession&)     = delete;
-    SvcRxSession& operator=(SvcRxSession&&) noexcept = delete;
+    SvcRequestRxSession(const SvcRequestRxSession&)                = delete;
+    SvcRequestRxSession(SvcRequestRxSession&&) noexcept            = delete;
+    SvcRequestRxSession& operator=(const SvcRequestRxSession&)     = delete;
+    SvcRequestRxSession& operator=(SvcRequestRxSession&&) noexcept = delete;
 
-    ~SvcRxSession()
+    ~SvcRequestRxSession()
     {
-        const std::int8_t result = ::canardRxUnsubscribe(&delegate_.canardInstance(), TransferKind, params_.service_id);
-        (void) result;
-        CETL_DEBUG_ASSERT(result >= 0, "There is no way currently to get an error here.");
-        CETL_DEBUG_ASSERT(result > 0, "Subscription supposed to be made at constructor.");
-
-        delegate_.onSessionEvent(TransportDelegate::SessionEvent::SvcRxLifetime{false /* is_added */});
+        delegate().cancelRxSubscriptionFor(subscription_, CanardTransferKindRequest);
+        delegate().onSessionEvent(TransportDelegate::SessionEvent::SvcRequestDestroyed{});
     }
 
 private:
-    // MARK: Interface
-
-    CETL_NODISCARD Params getParams() const noexcept override
-    {
-        return params_;
-    }
-
-    CETL_NODISCARD cetl::optional<ServiceRxTransfer> receive() override
-    {
-        if (last_rx_transfer_)
-        {
-            auto transfer = std::move(*last_rx_transfer_);
-            last_rx_transfer_.reset();
-            return transfer;
-        }
-        return cetl::nullopt;
-    }
-
-    void setOnReceiveCallback(ISvcRxSession::OnReceiveCallback::Function&& function) override
-    {
-        on_receive_cb_fn_ = std::move(function);
-    }
+    using Base = SvcRxSessionBase;
 
     // MARK: IRxSession
 
@@ -145,51 +105,92 @@ private:
         }
     }
 
-    // MARK: IRxSessionDelegate
-
-    void acceptRxTransfer(const CanardRxTransfer& transfer) override
-    {
-        const auto priority       = static_cast<Priority>(transfer.metadata.priority);
-        const auto remote_node_id = static_cast<NodeId>(transfer.metadata.remote_node_id);
-        const auto transfer_id    = static_cast<TransferId>(transfer.metadata.transfer_id);
-        const auto timestamp      = TimePoint{std::chrono::microseconds{transfer.timestamp_usec}};
-
-        // No Sonar `cpp:S5356` and `cpp:S5357` b/c we need to pass raw data from C libcanard api.
-        auto* const buffer = static_cast<cetl::byte*>(transfer.payload.data);  // NOSONAR cpp:S5356 cpp:S5357
-        TransportDelegate::CanardMemory canard_memory{delegate_,
-                                                      transfer.payload.allocated_size,
-                                                      buffer,
-                                                      transfer.payload.size};
-
-        const ServiceRxMetadata meta{{{transfer_id, priority}, timestamp}, remote_node_id};
-        ServiceRxTransfer       svc_rx_transfer{meta, ScatteredBuffer{std::move(canard_memory)}};
-        if (on_receive_cb_fn_)
-        {
-            on_receive_cb_fn_(ISvcRxSession::OnReceiveCallback::Arg{svc_rx_transfer});
-            return;
-        }
-        (void) last_rx_transfer_.emplace(std::move(svc_rx_transfer));
-    }
-
     // MARK: Data members:
 
-    TransportDelegate&                         delegate_;
-    const Params                               params_;
-    CanardRxSubscription                       subscription_;
-    cetl::optional<ServiceRxTransfer>          last_rx_transfer_;
-    ISvcRxSession::OnReceiveCallback::Function on_receive_cb_fn_;
+    CanardRxSubscription subscription_;
 
-};  // SvcRxSession
+};  // SvcRequestRxSession
 
 // MARK: -
 
-/// @brief A concrete class to represent a service request RX session (aka server side).
-///
-using SvcRequestRxSession = SvcRxSession<IRequestRxSession, RequestRxParams, CanardTransferKindRequest>;
-
 /// @brief A concrete class to represent a service response RX session (aka client side).
 ///
-using SvcResponseRxSession = SvcRxSession<IResponseRxSession, ResponseRxParams, CanardTransferKindResponse>;
+class SvcResponseRxSession final
+    : public transport::detail::  //
+      SvcRxSessionBase<IResponseRxSession, IRxSessionDelegate, TransportDelegate, ResponseRxParams, CanardMemory>
+{
+    /// @brief Defines private specification for making interface unique ptr.
+    ///
+    struct Spec : libcyphal::detail::UniquePtrSpec<IResponseRxSession, SvcResponseRxSession>
+    {
+        // `explicit` here is in use to disable public construction of derived private `Spec` structs.
+        // See https://seanmiddleditch.github.io/enabling-make-unique-with-private-constructors/
+        explicit Spec() = default;
+    };
+
+public:
+    CETL_NODISCARD static Expected<UniquePtr<IResponseRxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource&  memory,
+        TransportDelegate&           delegate,
+        const ResponseRxParams&      params,
+        RxSessionTreeNode::Response& rx_session_node)
+    {
+        if (params.service_id > CANARD_SERVICE_ID_MAX)
+        {
+            return ArgumentError{};
+        }
+
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params, rx_session_node);
+        if (session == nullptr)
+        {
+            return MemoryError{};
+        }
+
+        return session;
+    }
+
+    SvcResponseRxSession(const Spec,
+                         TransportDelegate&           delegate,
+                         const ResponseRxParams&      params,
+                         RxSessionTreeNode::Response& rx_session_node)
+        : Base{delegate, params}
+    {
+        delegate.retainRxSubscriptionFor(params);
+
+        rx_session_node.delegate() = this;
+
+        delegate.onSessionEvent(TransportDelegate::SessionEvent::SvcResponseCreated{});
+    }
+
+    SvcResponseRxSession(const SvcResponseRxSession&)                = delete;
+    SvcResponseRxSession(SvcResponseRxSession&&) noexcept            = delete;
+    SvcResponseRxSession& operator=(const SvcResponseRxSession&)     = delete;
+    SvcResponseRxSession& operator=(SvcResponseRxSession&&) noexcept = delete;
+
+    ~SvcResponseRxSession()
+    {
+        delegate().releaseRxSubscriptionFor(getParams());
+        delegate().onSessionEvent(TransportDelegate::SessionEvent::SvcResponseDestroyed{getParams()});
+    }
+
+private:
+    using Base = SvcRxSessionBase;
+
+    // MARK: IRxSession
+
+    void setTransferIdTimeout(const Duration timeout) override
+    {
+        const auto timeout_us = std::chrono::duration_cast<std::chrono::microseconds>(timeout);
+        if (timeout_us >= Duration::zero())
+        {
+            if (auto* const subscription = delegate().findRxSubscriptionFor(getParams()))
+            {
+                subscription->transfer_id_timeout_usec = static_cast<CanardMicrosecond>(timeout_us.count());
+            }
+        }
+    }
+
+};  // SvcResponseRxSession
 
 }  // namespace detail
 }  // namespace can

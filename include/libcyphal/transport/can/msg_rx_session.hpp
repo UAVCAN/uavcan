@@ -50,15 +50,17 @@ class MessageRxSession final : private IRxSessionDelegate, public IMessageRxSess
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IMessageRxSession>, AnyFailure> make(TransportDelegate&     delegate,
-                                                                                  const MessageRxParams& params)
+    CETL_NODISCARD static Expected<UniquePtr<IMessageRxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const MessageRxParams&      params)
     {
         if (params.subject_id > CANARD_SUBJECT_ID_MAX)
         {
             return ArgumentError{};
         }
 
-        auto session = libcyphal::detail::makeUniquePtr<Spec>(delegate.memory(), Spec{}, delegate, params);
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params);
         if (session == nullptr)
         {
             return MemoryError{};
@@ -72,20 +74,12 @@ public:
         , params_{params}
         , subscription_{}
     {
-        const std::int8_t result = ::canardRxSubscribe(&delegate.canardInstance(),
-                                                       CanardTransferKindMessage,
-                                                       params_.subject_id,
-                                                       params_.extent_bytes,
-                                                       CANARD_DEFAULT_TRANSFER_ID_TIMEOUT_USEC,
-                                                       &subscription_);
-        (void) result;
-        CETL_DEBUG_ASSERT(result >= 0, "There is no way currently to get an error here.");
-        CETL_DEBUG_ASSERT(result > 0, "New subscription supposed to be made.");
+        delegate.listenForRxSubscription(subscription_, params);
 
         // No Sonar `cpp:S5356` b/c we integrate here with C libcanard API.
         subscription_.user_reference = static_cast<IRxSessionDelegate*>(this);  // NOSONAR cpp:S5356
 
-        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgRxLifetime{true /* is_added */});
+        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgCreated{});
     }
 
     MessageRxSession(const MessageRxSession&)                = delete;
@@ -95,13 +89,8 @@ public:
 
     ~MessageRxSession()
     {
-        const std::int8_t result =
-            ::canardRxUnsubscribe(&delegate_.canardInstance(), CanardTransferKindMessage, params_.subject_id);
-        (void) result;
-        CETL_DEBUG_ASSERT(result >= 0, "There is no way currently to get an error here.");
-        CETL_DEBUG_ASSERT(result > 0, "Subscription supposed to be made at constructor.");
-
-        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgRxLifetime{false /* is_added */});
+        delegate_.cancelRxSubscriptionFor(subscription_, CanardTransferKindMessage);
+        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgDestroyed{});
     }
 
 private:
@@ -141,25 +130,14 @@ private:
 
     // MARK: IRxSessionDelegate
 
-    void acceptRxTransfer(const CanardRxTransfer& transfer) override
+    void acceptRxTransfer(CanardMemory&&            canard_memory,
+                          const TransferRxMetadata& rx_metadata,
+                          const NodeId              source_node_id) override
     {
-        const auto priority    = static_cast<Priority>(transfer.metadata.priority);
-        const auto transfer_id = static_cast<TransferId>(transfer.metadata.transfer_id);
-        const auto timestamp   = TimePoint{std::chrono::microseconds{transfer.timestamp_usec}};
-
         const cetl::optional<NodeId> publisher_node_id =
-            transfer.metadata.remote_node_id > CANARD_NODE_ID_MAX
-                ? cetl::nullopt
-                : cetl::make_optional<NodeId>(transfer.metadata.remote_node_id);
+            source_node_id > CANARD_NODE_ID_MAX ? cetl::nullopt : cetl::make_optional(source_node_id);
 
-        // No Sonar `cpp:S5356` and `cpp:S5357` b/c we need to pass raw data from C libcanard api.
-        auto* const buffer = static_cast<cetl::byte*>(transfer.payload.data);  // NOSONAR cpp:S5356 cpp:S5357
-        TransportDelegate::CanardMemory canard_memory{delegate_,
-                                                      transfer.payload.allocated_size,
-                                                      buffer,
-                                                      transfer.payload.size};
-
-        const MessageRxMetadata meta{{{transfer_id, priority}, timestamp}, publisher_node_id};
+        const MessageRxMetadata meta{rx_metadata, publisher_node_id};
         MessageRxTransfer       msg_rx_transfer{meta, ScatteredBuffer{std::move(canard_memory)}};
         if (on_receive_cb_fn_)
         {

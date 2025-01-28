@@ -12,6 +12,7 @@
 #include <libcyphal/errors.hpp>
 #include <libcyphal/transport/can/delegate.hpp>
 #include <libcyphal/transport/errors.hpp>
+#include <libcyphal/transport/svc_sessions.hpp>
 #include <libcyphal/transport/types.hpp>
 #include <libcyphal/types.hpp>
 
@@ -52,7 +53,10 @@ using testing::VariantWith;
 class TestCanDelegate : public testing::Test
 {
 protected:
-    class TransportDelegateImpl final : public detail::TransportDelegate
+    using CanardMemory      = can::detail::CanardMemory;
+    using TransportDelegate = can::detail::TransportDelegate;
+
+    class TransportDelegateImpl final : public TransportDelegate
     {
     public:
         explicit TransportDelegateImpl(cetl::pmr::memory_resource& memory)
@@ -68,7 +72,13 @@ protected:
                      const CanardTransferMetadata& metadata,
                      const PayloadFragments        payload_fragments),
                     (override));
-        MOCK_METHOD(void, onSessionEvent, (const SessionEvent::Variant& event_var), (override));
+
+        MOCK_METHOD(void, onSessionEvent, (const SessionEvent::Variant& event_var), (noexcept, override));  // NOLINT
+
+        MOCK_METHOD(can::detail::IRxSessionDelegate*,
+                    tryFindRxSessionDelegateFor,
+                    (const ResponseRxParams& params),
+                    (override));
     };
 
     void SetUp() override
@@ -93,23 +103,25 @@ protected:
 
 TEST_F(TestCanDelegate, CanardMemory_copy)
 {
-    using CanardMemory = detail::TransportDelegate::CanardMemory;
-
     TransportDelegateImpl delegate{mr_};
     auto&                 canard_instance = delegate.canardInstance();
 
-    const std::size_t payload_size   = 4;
-    const std::size_t allocated_size = payload_size + 1;
-    auto* const       payload        = static_cast<byte*>(
-        canard_instance.memory.allocate(static_cast<detail::TransportDelegate*>(&delegate), allocated_size));
+    constexpr std::size_t payload_size   = 4;
+    constexpr std::size_t allocated_size = payload_size + 1;
+    auto* const           payload =
+        static_cast<byte*>(canard_instance.memory.allocate(static_cast<TransportDelegate*>(&delegate), allocated_size));
     fillIotaBytes({payload, allocated_size}, b('0'));
 
-    const CanardMemory canard_memory{delegate, allocated_size, payload, payload_size};
+    CanardMutablePayload canard_payload{payload_size, payload, allocated_size};
+    const CanardMemory canard_memory{mr_, canard_payload};
     EXPECT_THAT(canard_memory.size(), payload_size);
+    EXPECT_THAT(canard_payload.size, 0);
+    EXPECT_THAT(canard_payload.data, nullptr);
+    EXPECT_THAT(canard_payload.allocated_size, 0);
 
     // Ask exactly as payload
     {
-        const std::size_t          ask_size = payload_size;
+        constexpr std::size_t      ask_size = payload_size;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(canard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -118,7 +130,7 @@ TEST_F(TestCanDelegate, CanardMemory_copy)
 
     // Ask more than payload
     {
-        const std::size_t          ask_size = payload_size + 2;
+        constexpr std::size_t      ask_size = payload_size + 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(canard_memory.copy(0, buffer.data(), ask_size), payload_size);
@@ -127,7 +139,7 @@ TEST_F(TestCanDelegate, CanardMemory_copy)
 
     // Ask less than payload (with different offsets)
     {
-        const std::size_t          ask_size = payload_size - 2;
+        constexpr std::size_t      ask_size = payload_size - 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(canard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -153,18 +165,20 @@ TEST_F(TestCanDelegate, CanardMemory_copy)
 
 TEST_F(TestCanDelegate, CanardMemory_copy_on_moved)
 {
-    using CanardMemory = can::detail::TransportDelegate::CanardMemory;
-
     TransportDelegateImpl delegate{mr_};
     auto&                 canard_instance = delegate.canardInstance();
 
     constexpr std::size_t payload_size = 4;
-    auto* const           payload      = static_cast<byte*>(
-        canard_instance.memory.allocate(static_cast<detail::TransportDelegate*>(&delegate), payload_size));
+    auto* const           payload =
+        static_cast<byte*>(canard_instance.memory.allocate(static_cast<TransportDelegate*>(&delegate), payload_size));
     fillIotaBytes({payload, payload_size}, b('0'));
 
-    CanardMemory old_canard_memory{delegate, payload_size, payload, payload_size};
+    CanardMutablePayload canard_payload{payload_size, payload, payload_size};
+    CanardMemory old_canard_memory{mr_, canard_payload};
     EXPECT_THAT(old_canard_memory.size(), payload_size);
+    EXPECT_THAT(canard_payload.size, 0);
+    EXPECT_THAT(canard_payload.data, nullptr);
+    EXPECT_THAT(canard_payload.allocated_size, 0);
 
     const CanardMemory new_canard_memory{std::move(old_canard_memory)};
     // NOLINTNEXTLINE(clang-analyzer-cplusplus.Move,bugprone-use-after-move,hicpp-invalid-access-moved)
@@ -179,7 +193,7 @@ TEST_F(TestCanDelegate, CanardMemory_copy_on_moved)
         EXPECT_THAT(buffer, Each(b('\0')));
     }
 
-    // Try new one
+    // Try a new one
     {
         std::array<byte, payload_size> buffer{};
         EXPECT_THAT(new_canard_memory.copy(0, buffer.data(), buffer.size()), payload_size);
@@ -189,15 +203,15 @@ TEST_F(TestCanDelegate, CanardMemory_copy_on_moved)
 
 TEST_F(TestCanDelegate, optAnyFailureFromCanard)
 {
-    EXPECT_THAT(can::detail::TransportDelegate::optAnyFailureFromCanard(-CANARD_ERROR_OUT_OF_MEMORY),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromCanard(-CANARD_ERROR_OUT_OF_MEMORY),
                 Optional(VariantWith<MemoryError>(_)));
 
-    EXPECT_THAT(can::detail::TransportDelegate::optAnyFailureFromCanard(-CANARD_ERROR_INVALID_ARGUMENT),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromCanard(-CANARD_ERROR_INVALID_ARGUMENT),
                 Optional(VariantWith<libcyphal::ArgumentError>(_)));
 
-    EXPECT_THAT(can::detail::TransportDelegate::optAnyFailureFromCanard(0), Eq(cetl::nullopt));
-    EXPECT_THAT(can::detail::TransportDelegate::optAnyFailureFromCanard(1), Eq(cetl::nullopt));
-    EXPECT_THAT(can::detail::TransportDelegate::optAnyFailureFromCanard(-1), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromCanard(0), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromCanard(1), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromCanard(-1), Eq(cetl::nullopt));
 }
 
 TEST_F(TestCanDelegate, canardMemoryAllocate_no_memory)
@@ -205,13 +219,13 @@ TEST_F(TestCanDelegate, canardMemoryAllocate_no_memory)
     StrictMock<MemoryResourceMock> mr_mock;
 
     TransportDelegateImpl delegate{mr_mock};
-    auto&                 canard_instance = delegate.canardInstance();
+    const auto&           canard_instance = delegate.canardInstance();
 
     // Emulate that there is no memory at all.
     EXPECT_CALL(mr_mock, do_allocate(_, _))  //
         .WillOnce(Return(nullptr));
 
-    EXPECT_THAT(canard_instance.memory.allocate(static_cast<detail::TransportDelegate*>(&delegate), 1), IsNull());
+    EXPECT_THAT(canard_instance.memory.allocate(static_cast<TransportDelegate*>(&delegate), 1), IsNull());
 }
 
 TEST_F(TestCanDelegate, CanardConcreteTree_visitCounting)
@@ -248,7 +262,7 @@ TEST_F(TestCanDelegate, CanardConcreteTree_visitCounting)
     right_rl.up             = &right_r;
     right_r.lr[0]           = &right_rl;
 
-    using MyTree = can::detail::TransportDelegate::CanardConcreteTree<const MyNode>;
+    using MyTree = TransportDelegate::CanardConcreteTree<const MyNode>;
     {
         std::vector<std::string> names;
         auto count = MyTree::visitCounting(&root, [&names](const MyNode& node) { names.push_back(node.name); });

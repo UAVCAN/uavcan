@@ -7,7 +7,6 @@
 #define LIBCYPHAL_TRANSPORT_UDP_MSG_RX_SESSION_HPP_INCLUDED
 
 #include "delegate.hpp"
-#include "session_tree.hpp"
 
 #include "libcyphal/errors.hpp"
 #include "libcyphal/transport/errors.hpp"
@@ -50,7 +49,7 @@ class MessageRxSession final : private IMsgRxSessionDelegate, public IMessageRxS
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IMessageRxSession>, AnyFailure> make(
+    CETL_NODISCARD static Expected<UniquePtr<IMessageRxSession>, AnyFailure> make(  //
         cetl::pmr::memory_resource& memory,
         TransportDelegate&          delegate,
         const MessageRxParams&      params,
@@ -97,7 +96,7 @@ public:
     {
         ::udpardRxSubscriptionFree(&subscription_);
 
-        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgDestroyed{params_.subject_id});
+        delegate_.onSessionEvent(TransportDelegate::SessionEvent::MsgDestroyed{params_});
     }
 
     // In use (public) for unit tests only.
@@ -143,20 +142,14 @@ private:
 
     // MARK: IRxSessionDelegate
 
-    void acceptRxTransfer(UdpardRxTransfer& inout_transfer) override
+    void acceptRxTransfer(UdpardMemory&&            udpard_memory,
+                          const TransferRxMetadata& rx_metadata,
+                          const NodeId              source_node_id) override
     {
-        const auto transfer_id = inout_transfer.transfer_id;
-        const auto priority    = static_cast<Priority>(inout_transfer.priority);
-        const auto timestamp   = TimePoint{std::chrono::microseconds{inout_transfer.timestamp_usec}};
-
         const cetl::optional<NodeId> publisher_node_id =
-            inout_transfer.source_node_id > UDPARD_NODE_ID_MAX
-                ? cetl::nullopt
-                : cetl::make_optional<NodeId>(inout_transfer.source_node_id);
+            source_node_id > UDPARD_NODE_ID_MAX ? cetl::nullopt : cetl::make_optional(source_node_id);
 
-        TransportDelegate::UdpardMemory udpard_memory{delegate_, inout_transfer};
-
-        const MessageRxMetadata meta{{{transfer_id, priority}, timestamp}, publisher_node_id};
+        const MessageRxMetadata meta{rx_metadata, publisher_node_id};
         MessageRxTransfer       msg_rx_transfer{meta, ScatteredBuffer{std::move(udpard_memory)}};
         if (on_receive_cb_fn_)
         {

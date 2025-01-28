@@ -115,8 +115,8 @@ protected:
         return transport;
     }
 
-    IMedia::PopResult::Metadata makeFragmentFromCanDumpLine(const std::string&     can_dump_line,
-                                                            cetl::span<cetl::byte> payload)
+    IMedia::PopResult::Metadata makeFragmentFromCanDumpLine(const std::string&           can_dump_line,
+                                                            const cetl::span<cetl::byte> payload) const
     {
         const auto pound = can_dump_line.find('#');
 
@@ -197,18 +197,33 @@ TEST_F(TestCanSvcRxSessions, make_response_no_memory)
     EXPECT_CALL(mr_mock, do_allocate(sizeof(can::detail::SvcResponseRxSession), _))  //
         .WillOnce(Return(nullptr));
 
-    auto transport = makeTransport(mr_mock, 0x13);
+    const auto transport = makeTransport(mr_mock, 0x13);
 
-    auto maybe_session = transport->makeResponseRxSession({64, 0x23, 0x45});
+    const auto maybe_session = transport->makeResponseRxSession({64, 0x23, 0x45});
+    EXPECT_THAT(maybe_session, VariantWith<AnyFailure>(VariantWith<MemoryError>(_)));
+}
+
+TEST_F(TestCanSvcRxSessions, make_request_no_memory)
+{
+    StrictMock<MemoryResourceMock> mr_mock;
+    mr_mock.redirectExpectedCallsTo(mr_);
+
+    // Emulate that there is no memory available for the message session.
+    EXPECT_CALL(mr_mock, do_allocate(sizeof(can::detail::SvcRequestRxSession), _))  //
+        .WillOnce(Return(nullptr));
+
+    const auto transport = makeTransport(mr_mock, 0x31);
+
+    const auto maybe_session = transport->makeRequestRxSession({64, 123});
     EXPECT_THAT(maybe_session, VariantWith<AnyFailure>(VariantWith<MemoryError>(_)));
 }
 
 TEST_F(TestCanSvcRxSessions, make_request_fails_due_to_argument_error)
 {
-    auto transport = makeTransport(mr_, 0x31);
+    const auto transport = makeTransport(mr_, 0x31);
 
     // Try invalid subject id
-    auto maybe_session = transport->makeRequestRxSession({64, CANARD_SERVICE_ID_MAX + 1});
+    const auto maybe_session = transport->makeRequestRxSession({64, CANARD_SERVICE_ID_MAX + 1});
     EXPECT_THAT(maybe_session, VariantWith<AnyFailure>(VariantWith<libcyphal::ArgumentError>(_)));
 }
 
@@ -228,7 +243,7 @@ TEST_F(TestCanSvcRxSessions, receive_request)
     auto session = cetl::get<UniquePtr<IRequestRxSession>>(std::move(maybe_session));
 
     EXPECT_CALL(media_mock_, setFilters(SizeIs(1)))  //
-        .WillOnce([&](Filters filters) {
+        .WillOnce([&](const Filters filters) {
             EXPECT_THAT(filters,
                         Contains(FilterEq({0b1'0'0'101111011'0110001'0000000, 0b1'0'1'111111111'1111111'0000000})));
             return cetl::nullopt;
@@ -301,7 +316,7 @@ TEST_F(TestCanSvcRxSessions, receive_request)
 
 TEST_F(TestCanSvcRxSessions, receive_request_via_callback)
 {
-    auto transport = makeTransport(mr_, 0x31);
+    const auto transport = makeTransport(mr_, 0x31);
 
     EXPECT_CALL(media_mock_, registerPopCallback(_))  //
         .WillOnce(Invoke([&](auto function) {         //
@@ -313,7 +328,7 @@ TEST_F(TestCanSvcRxSessions, receive_request_via_callback)
     auto session = cetl::get<UniquePtr<IRequestRxSession>>(std::move(maybe_session));
 
     EXPECT_CALL(media_mock_, setFilters(SizeIs(1)))  //
-        .WillOnce([&](Filters filters) {
+        .WillOnce([&](const Filters filters) {
             EXPECT_THAT(filters,
                         Contains(FilterEq({0b1'0'0'101111011'0110001'0000000, 0b1'0'1'111111111'1111111'0000000})));
             return cetl::nullopt;
@@ -367,25 +382,31 @@ TEST_F(TestCanSvcRxSessions, receive_response)
             return scheduler_.registerNamedCallback("rx", std::move(function));
         }));
 
-    constexpr std::size_t extent_bytes  = 8;
-    auto                  maybe_session = transport->makeResponseRxSession({extent_bytes, 0x17B, 0x31});
-    ASSERT_THAT(maybe_session, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
-    auto session = cetl::get<UniquePtr<IResponseRxSession>>(std::move(maybe_session));
+    constexpr std::size_t extent_bytes      = 8;
+    auto                  maybe_session_n31 = transport->makeResponseRxSession({extent_bytes, 0x17B, 0x31});
+    ASSERT_THAT(maybe_session_n31, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
+    auto session_n31 = cetl::get<UniquePtr<IResponseRxSession>>(std::move(maybe_session_n31));
 
     EXPECT_CALL(media_mock_, setFilters(SizeIs(1)))  //
-        .WillOnce([&](Filters filters) {
+        .WillOnce([&](const Filters filters) {
             EXPECT_THAT(filters,
                         Contains(FilterEq({0b1'0'0'101111011'0010011'0000000, 0b1'0'1'111111111'1111111'0000000})));
             return cetl::nullopt;
         });
 
-    const auto params = session->getParams();
+    const auto params = session_n31->getParams();
     EXPECT_THAT(params.extent_bytes, extent_bytes);
     EXPECT_THAT(params.service_id, 0x17B);
     EXPECT_THAT(params.server_node_id, 0x31);
 
     constexpr auto timeout = 200ms;
-    session->setTransferIdTimeout(timeout);
+    session_n31->setTransferIdTimeout(timeout);
+
+    // Create another session with the same port ID but different server node ID (0x32).
+    //
+    auto maybe_session_n32 = transport->makeResponseRxSession({extent_bytes, 0x17B, 0x32});
+    ASSERT_THAT(maybe_session_n32, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
+    auto session_n32 = cetl::get<UniquePtr<IResponseRxSession>>(std::move(maybe_session_n32));
 
     TimePoint rx_timestamp;
 
@@ -407,8 +428,9 @@ TEST_F(TestCanSvcRxSessions, receive_response)
 
         scheduler_.scheduleAt(rx_timestamp + 1ms, [&](const auto&) {
             //
-            const auto maybe_rx_transfer = session->receive();
+            const auto maybe_rx_transfer = session_n31->receive();
             ASSERT_THAT(maybe_rx_transfer, Optional(_));
+            EXPECT_THAT(session_n32->receive(), Eq(cetl::nullopt));  // Different server node ID.
             // NOLINTNEXTLINE(bugprone-unchecked-optional-access)
             const auto& rx_transfer = maybe_rx_transfer.value();
 
@@ -438,9 +460,35 @@ TEST_F(TestCanSvcRxSessions, receive_response)
 
         scheduler_.scheduleAt(rx_timestamp + 1ms, [&](const auto&) {
             //
-            const auto maybe_rx_transfer = session->receive();
+            const auto maybe_rx_transfer = session_n31->receive();
             EXPECT_THAT(maybe_rx_transfer, Eq(cetl::nullopt));
         });
+    });
+    scheduler_.scheduleAt(3s, [&](const auto&) {
+        //
+        SCOPED_TRACE("3-rd iteration: unsolicited (node 0x33) response @ 3s");
+
+        rx_timestamp = now() + 10ms;
+        EXPECT_CALL(media_mock_, pop(_))  //
+            .WillOnce([&](auto p) {
+                EXPECT_THAT(now(), rx_timestamp);
+                EXPECT_THAT(p.size(), CANARD_MTU_MAX);
+                p[0] = b(0b111'11101);
+                return IMedia::PopResult::Metadata{rx_timestamp, 0b011'1'0'0'101111011'0010011'0110011, 1};
+            });
+        scheduler_.scheduleNamedCallback("rx", rx_timestamp);
+
+        scheduler_.scheduleAt(rx_timestamp + 1ms, [&](const auto&) {
+            //
+            EXPECT_THAT(session_n31->receive(), Eq(cetl::nullopt));
+            EXPECT_THAT(session_n32->receive(), Eq(cetl::nullopt));
+        });
+    });
+    scheduler_.scheduleAt(9s, [&](const auto&) {
+        //
+        session_n31.reset();
+        session_n32.reset();
+        transport.reset();
     });
     scheduler_.spinFor(10s);
 }
@@ -448,7 +496,7 @@ TEST_F(TestCanSvcRxSessions, receive_response)
 // NOLINTNEXTLINE(readability-function-cognitive-complexity)
 TEST_F(TestCanSvcRxSessions, receive_two_frames)
 {
-    auto transport = makeTransport(mr_, 0x31);
+    const auto transport = makeTransport(mr_, 0x31);
 
     EXPECT_CALL(media_mock_, registerPopCallback(_))  //
         .WillOnce(Invoke([&](auto function) {         //
@@ -458,16 +506,16 @@ TEST_F(TestCanSvcRxSessions, receive_two_frames)
     constexpr std::size_t extent_bytes  = 8;
     auto                  maybe_session = transport->makeRequestRxSession({extent_bytes, 0x17B});
     ASSERT_THAT(maybe_session, VariantWith<UniquePtr<IRequestRxSession>>(NotNull()));
-    auto session = cetl::get<UniquePtr<IRequestRxSession>>(std::move(maybe_session));
+    const auto session = cetl::get<UniquePtr<IRequestRxSession>>(std::move(maybe_session));
 
     EXPECT_CALL(media_mock_, setFilters(SizeIs(1)))  //
-        .WillOnce([&](Filters filters) {
+        .WillOnce([&](const Filters filters) {
             EXPECT_THAT(filters,
                         Contains(FilterEq({0b1'0'0'101111011'0110001'0000000, 0b1'0'1'111111111'1111111'0000000})));
             return cetl::nullopt;
         });
 
-    auto first_rx_timestamp = TimePoint{1s + 10ms};
+    constexpr auto first_rx_timestamp = TimePoint{1s + 10ms};
 
     scheduler_.scheduleAt(1s, [&](const auto&) {
         //
@@ -532,7 +580,7 @@ TEST_F(TestCanSvcRxSessions, receive_two_frames)
 
 TEST_F(TestCanSvcRxSessions, unsubscribe)
 {
-    auto transport = makeTransport(mr_, 0x31);
+    const auto transport = makeTransport(mr_, 0x31);
 
     EXPECT_CALL(media_mock_, registerPopCallback(_))  //
         .WillOnce(Invoke([&](auto function) {         //
@@ -545,7 +593,7 @@ TEST_F(TestCanSvcRxSessions, unsubscribe)
     auto session = cetl::get<UniquePtr<IRequestRxSession>>(std::move(maybe_session));
 
     EXPECT_CALL(media_mock_, setFilters(SizeIs(1)))  //
-        .WillOnce([&](Filters filters) {
+        .WillOnce([&](const Filters filters) {
             EXPECT_THAT(filters, Contains(FilterEq({0x025ED880, 0x02FFFF80})));
             return cetl::nullopt;
         });
@@ -553,7 +601,7 @@ TEST_F(TestCanSvcRxSessions, unsubscribe)
     scheduler_.scheduleAt(1s, [&](const auto&) {
         //
         EXPECT_CALL(media_mock_, setFilters(IsEmpty()))  //
-            .WillOnce([&](Filters) {                     //
+            .WillOnce([&](const Filters) {               //
                 return cetl::nullopt;
             });
         session.reset();
@@ -596,7 +644,7 @@ TEST_F(TestCanSvcRxSessions, receive_multiple_tids_frames)
         //
         // response 1001, tid=0, accepted
         std::make_tuple(std::ref(media_mock_), 350755us, "slcan0", "1224D52F#E9030000000000A0"),  // ☑️create!,iface←0
-        std::make_tuple(std::ref(media_mock_), 350764us, "slcan0", "1224D52F#00C08C40"),  // ⚡️0️⃣tid←1
+        std::make_tuple(std::ref(media_mock_), 350764us, "slcan0", "1224D52F#00C08C40"),          // ⚡️0️⃣tid←1
         //
         // CAN2 response 1001, tid=0, dropped as duplicate
         std::make_tuple(std::ref(media_mock2), 350783us, "slcan2", "1224D52F#E9030000000000A0"),  // ❌tid≠1
@@ -604,7 +652,7 @@ TEST_F(TestCanSvcRxSessions, receive_multiple_tids_frames)
         //
         // CAN2 response 2001, tid=1, accepted by resync to interface #2
         std::make_tuple(std::ref(media_mock2), 351336us, "slcan2", "1224D52F#D1070000000000A1"),  // ☑️tid=1,iface←2
-        std::make_tuple(std::ref(media_mock2), 351338us, "slcan2", "1224D52F#00594C41"),  // ⚡️1️⃣tid←2
+        std::make_tuple(std::ref(media_mock2), 351338us, "slcan2", "1224D52F#00594C41"),          // ⚡️1️⃣tid←2
         //
         // CAN2 partial response 3001, accepted
         std::make_tuple(std::ref(media_mock2), 351340us, "slcan2", "1224D52F#B90B0000000000A2"),  // ☑️
@@ -615,14 +663,14 @@ TEST_F(TestCanSvcRxSessions, receive_multiple_tids_frames)
         //
         // CAN0 response 3001, tid=2, dropped as wrong interface (expected #2)
         std::make_tuple(std::ref(media_mock_), 351478us, "slcan0", "1224D52F#B90B0000000000A2"),  // ❌iface≠2 & !idle
-        std::make_tuple(std::ref(media_mock_), 351479us, "slcan0", "1224D52F#00984542"),  // ❌iface≠2 & !idle
+        std::make_tuple(std::ref(media_mock_), 351479us, "slcan0", "1224D52F#00984542"),          // ❌iface≠2 & !idle
         //
         // CAN2 final fragment response 3001, tid=2, accepted
         std::make_tuple(std::ref(media_mock2), 351697us, "slcan2", "1224D52F#00984542"),  //      // ⚡️2️⃣tid←3
         //
         // CAN2 response 4001, tid=3, accepted
         std::make_tuple(std::ref(media_mock2), 351700us, "slcan2", "1224D52F#A10F0000000000A3"),  // ☑️
-        std::make_tuple(std::ref(media_mock2), 351702us, "slcan2", "1224D52F#007AED43"),  // ⚡️3️⃣tid←4
+        std::make_tuple(std::ref(media_mock2), 351702us, "slcan2", "1224D52F#007AED43"),          // ⚡️3️⃣tid←4
         //
         // CAN0 response 4001, tid=3, dropped as duplicate
         std::make_tuple(std::ref(media_mock_), 351730us, "slcan0", "1224D52F#A10F0000000000A3"),  // ❌tid≠4
@@ -630,7 +678,7 @@ TEST_F(TestCanSvcRxSessions, receive_multiple_tids_frames)
         //
         // CAN2 response 5001, tid=4, accepted
         std::make_tuple(std::ref(media_mock2), 352747us, "slcan2", "1224D52F#89130000000000A4"),  // ☑️
-        std::make_tuple(std::ref(media_mock2), 352777us, "slcan2", "1224D52F#007A4F44"),  // ⚡️4️⃣tid←5
+        std::make_tuple(std::ref(media_mock2), 352777us, "slcan2", "1224D52F#007A4F44"),          // ⚡️4️⃣tid←5
         //
         // CAN0 response 5001, tid=4, dropped as duplicate
         std::make_tuple(std::ref(media_mock_), 352800us, "slcan0", "1224D52F#89130000000000A4"),  // ❌tid≠5

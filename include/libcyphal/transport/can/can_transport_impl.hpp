@@ -11,6 +11,7 @@
 #include "media.hpp"
 #include "msg_rx_session.hpp"
 #include "msg_tx_session.hpp"
+#include "rx_session_tree_node.hpp"
 #include "svc_rx_sessions.hpp"
 #include "svc_tx_sessions.hpp"
 
@@ -19,6 +20,7 @@
 #include "libcyphal/transport/errors.hpp"
 #include "libcyphal/transport/lizard_helpers.hpp"
 #include "libcyphal/transport/msg_sessions.hpp"
+#include "libcyphal/transport/session_tree.hpp"
 #include "libcyphal/transport/svc_sessions.hpp"
 #include "libcyphal/transport/types.hpp"
 #include "libcyphal/types.hpp"
@@ -167,8 +169,7 @@ public:
         : TransportDelegate{memory}
         , executor_{executor}
         , media_array_{std::move(media_array)}
-        , total_msg_rx_ports_{0}
-        , total_svc_rx_ports_{0}
+        , svc_response_rx_session_nodes_{memory}
     {
         scheduleConfigOfFilters();
     }
@@ -187,9 +188,7 @@ public:
             flushCanardTxQueue(media.canard_tx_queue(), canardInstance());
         }
 
-        CETL_DEBUG_ASSERT(total_msg_rx_ports_ == 0,  //
-                          "Message sessions must be destroyed before transport.");
-        CETL_DEBUG_ASSERT(total_svc_rx_ports_ == 0,  //
+        CETL_DEBUG_ASSERT(svc_response_rx_session_nodes_.isEmpty(),
                           "Service sessions must be destroyed before transport.");
     }
 
@@ -245,7 +244,8 @@ private:
         //
         // @see scheduleConfigOfFilters
         //
-        if (total_svc_rx_ports_ > 0)
+        const auto& subs_stats = getSubscriptionStats();
+        if (subs_stats.total_svc_rx_ports > 0)
         {
             const bool result = configure_filters_callback_.schedule(Callback::Schedule::Once{executor_.now()});
             (void) result;
@@ -271,41 +271,43 @@ private:
     CETL_NODISCARD Expected<UniquePtr<IMessageRxSession>, AnyFailure> makeMessageRxSession(
         const MessageRxParams& params) override
     {
-        return makeRxSession<IMessageRxSession, MessageRxSession>(CanardTransferKindMessage, params.subject_id, params);
+        return makeRxSessionImpl<IMessageRxSession, MessageRxSession>(  //
+            CanardTransferKindMessage,
+            params.subject_id,
+            params);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IMessageTxSession>, AnyFailure> makeMessageTxSession(
         const MessageTxParams& params) override
     {
-        return MessageTxSession::make(asDelegate(), params);
+        return MessageTxSession::make(memory(), asDelegate(), params);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IRequestRxSession>, AnyFailure> makeRequestRxSession(
         const RequestRxParams& params) override
     {
-        return makeRxSession<IRequestRxSession, SvcRequestRxSession>(CanardTransferKindRequest,
-                                                                     params.service_id,
-                                                                     params);
+        return makeRxSessionImpl<IRequestRxSession, SvcRequestRxSession>(  //
+            CanardTransferKindRequest,
+            params.service_id,
+            params);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IRequestTxSession>, AnyFailure> makeRequestTxSession(
         const RequestTxParams& params) override
     {
-        return SvcRequestTxSession::make(asDelegate(), params);
+        return SvcRequestTxSession::make(memory(), asDelegate(), params);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IResponseRxSession>, AnyFailure> makeResponseRxSession(
         const ResponseRxParams& params) override
     {
-        return makeRxSession<IResponseRxSession, SvcResponseRxSession>(CanardTransferKindResponse,
-                                                                       params.service_id,
-                                                                       params);
+        return makeResponseRxSessionImpl(params);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IResponseTxSession>, AnyFailure> makeResponseTxSession(
         const ResponseTxParams& params) override
     {
-        return SvcResponseTxSession::make(asDelegate(), params);
+        return SvcResponseTxSession::make(memory(), asDelegate(), params);
     }
 
     // MARK: TransportDelegate
@@ -358,16 +360,39 @@ private:
         return cetl::nullopt;
     }
 
-    void onSessionEvent(const SessionEvent::Variant& event_var) override
+    void onSessionEvent(const SessionEvent::Variant& event_var) noexcept override
     {
-        SessionEventHandler handler_with{*this};
-        cetl::visit(handler_with, event_var);
+        // `visit` might hypothetically throw, so we need to catch it.
+        const auto result = libcyphal::detail::performWithoutThrowing([this, &event_var] {
+            //
+            cetl::visit(cetl::make_overloaded(  //
+                            [this](const SessionEvent::SvcResponseDestroyed& event) noexcept {
+                                //
+                                svc_response_rx_session_nodes_.removeNodeFor(event.params);
+                            },
+                            [](const auto&) noexcept {
+                                // No specific action needed for other events.
+                                // But we still might need to reconfigure filters (see below after `visit`).
+                            }),
+                        event_var);
+        });
+        (void) result;
+        CETL_DEBUG_ASSERT(result, "");
 
         cancelRxCallbacksIfNoPortsLeft();
         scheduleConfigOfFilters();
     }
 
-    void scheduleConfigOfFilters()
+    IRxSessionDelegate* tryFindRxSessionDelegateFor(const ResponseRxParams& params) override
+    {
+        if (auto* const node = svc_response_rx_session_nodes_.tryFindNodeFor(params))
+        {
+            return node->delegate();
+        }
+        return nullptr;
+    }
+
+    void scheduleConfigOfFilters() noexcept
     {
         if (!configure_filters_callback_)
         {
@@ -386,50 +411,14 @@ private:
 
     using Self = TransportImpl;
 
-    struct SessionEventHandler
-    {
-        explicit SessionEventHandler(Self& self)
-            : self_{self}
-        {
-        }
+    template <typename Node>
+    using SessionTree = transport::detail::SessionTree<Node>;
 
-        void operator()(const SessionEvent::MsgRxLifetime& lifetime) const
-        {
-            if (lifetime.is_added)
-            {
-                ++self_.total_msg_rx_ports_;
-            }
-            else
-            {
-                // We are not going to allow negative number of ports.
-                CETL_DEBUG_ASSERT(self_.total_msg_rx_ports_ > 0, "");
-                self_.total_msg_rx_ports_ -= std::min(static_cast<std::size_t>(1), self_.total_msg_rx_ports_);
-            }
-        }
-
-        void operator()(const SessionEvent::SvcRxLifetime& lifetime) const
-        {
-            if (lifetime.is_added)
-            {
-                ++self_.total_svc_rx_ports_;
-            }
-            else
-            {
-                // We are not going to allow negative number of ports.
-                CETL_DEBUG_ASSERT(self_.total_svc_rx_ports_ > 0, "");
-                self_.total_svc_rx_ports_ -= std::min(static_cast<std::size_t>(1), self_.total_svc_rx_ports_);
-            }
-        }
-
-    private:
-        Self& self_;
-
-    };  // SessionEventHandler
-
-    template <typename Interface, typename Factory, typename RxParams>
-    CETL_NODISCARD auto makeRxSession(const CanardTransferKind transfer_kind,
-                                      const PortId             port_id,
-                                      const RxParams&          rx_params) -> Expected<UniquePtr<Interface>, AnyFailure>
+    template <typename Interface, typename Factory, typename Params>
+    CETL_NODISCARD auto makeRxSessionImpl(  //
+        const CanardTransferKind transfer_kind,
+        const PortId             port_id,
+        const Params&            params) -> Expected<UniquePtr<Interface>, AnyFailure>
     {
         const std::int8_t has_port = ::canardRxGetSubscription(&canardInstance(), transfer_kind, port_id, nullptr);
         CETL_DEBUG_ASSERT(has_port >= 0, "There is no way currently to get an error here.");
@@ -438,9 +427,45 @@ private:
             return AlreadyExistsError{};
         }
 
-        auto session_result = Factory::make(asDelegate(), rx_params);
+        auto session_result = Factory::make(memory(), asDelegate(), params);
         if (auto* const make_failure = cetl::get_if<AnyFailure>(&session_result))
         {
+            return std::move(*make_failure);
+        }
+
+        for (Media& media : media_array_)
+        {
+            if (!media.rx_callback())
+            {
+                media.rx_callback() = media.interface().registerPopCallback([this, &media](const auto&) {  //
+                    //
+                    receiveNextFrame(media);
+                });
+            }
+        }
+
+        return session_result;
+    }
+
+    CETL_NODISCARD auto makeResponseRxSessionImpl(  //
+        const ResponseRxParams& params) -> Expected<UniquePtr<IResponseRxSession>, AnyFailure>
+    {
+        // Make sure that session is unique per given parameters.
+        // For response sessions, the uniqueness is based on the service ID and the server node ID.
+        //
+        auto node_result = svc_response_rx_session_nodes_.ensureNodeFor<true>(params);  // should be new
+        if (auto* const failure = cetl::get_if<AnyFailure>(&node_result))
+        {
+            return std::move(*failure);
+        }
+        auto& new_svc_node = cetl::get<RxSessionTreeNode::Response::RefWrapper>(node_result).get();
+
+        auto session_result = SvcResponseRxSession::make(memory(), asDelegate(), params, new_svc_node);
+        if (auto* const make_failure = cetl::get_if<AnyFailure>(&session_result))
+        {
+            // We failed to create the session, so we need to release the unique node.
+            // The sockets we made earlier will be released in the destructor of whole transport.
+            svc_response_rx_session_nodes_.removeNodeFor(params);
             return std::move(*make_failure);
         }
 
@@ -568,9 +593,16 @@ private:
 
             // No Sonar `cpp:S5357` b/c the raw `user_reference` is part of libcanard api,
             // and it was set by us at a RX session constructor (see f.e. `MessageRxSession` ctor).
-            auto* const delegate =
+            auto* const session_delegate =
                 static_cast<IRxSessionDelegate*>(out_subscription->user_reference);  // NOSONAR cpp:S5357
-            delegate->acceptRxTransfer(out_transfer);
+
+            const auto transfer_id = static_cast<TransferId>(out_transfer.metadata.transfer_id);
+            const auto priority    = static_cast<Priority>(out_transfer.metadata.priority);
+            const auto timestamp   = TimePoint{std::chrono::microseconds{out_transfer.timestamp_usec}};
+
+            session_delegate->acceptRxTransfer(CanardMemory{memory(), out_transfer.payload},
+                                               TransferRxMetadata{{transfer_id, priority}, timestamp},
+                                               out_transfer.metadata.remote_node_id);
         }
     }
 
@@ -712,71 +744,10 @@ private:
         }
     }
 
-    /// @brief Fills an array with filters for each active RX port.
-    ///
-    CETL_NODISCARD bool fillMediaFiltersArray(libcyphal::detail::VarArray<Filter>& filters)
+    void cancelRxCallbacksIfNoPortsLeft() noexcept
     {
-        using RxSubscription     = const CanardRxSubscription;
-        using RxSubscriptionTree = CanardConcreteTree<RxSubscription>;
-
-        // Total "active" RX ports depends on the local node ID. For anonymous nodes,
-        // we don't account for service ports (b/c they don't work while being anonymous).
-        //
-        const auto        local_node_id      = static_cast<CanardNodeID>(getNodeId());
-        const auto        is_anonymous       = local_node_id > CANARD_NODE_ID_MAX;
-        const std::size_t total_active_ports = total_msg_rx_ports_ + (is_anonymous ? 0 : total_svc_rx_ports_);
-        if (total_active_ports == 0)
-        {
-            // No need to allocate memory for zero filters.
-            return true;
-        }
-
-        // Now we know that we have at least one active port,
-        // so we need preallocate temp memory for total number of active ports.
-        //
-        filters.reserve(total_active_ports);
-        if (filters.capacity() < total_active_ports)
-        {
-            // This is out of memory situation.
-            return false;
-        }
-
-        // `ports_count` counting is just for the sake of debug verification.
-        std::size_t ports_count = 0;
-
-        const auto& subs_trees = canardInstance().rx_subscriptions;
-
-        if (total_msg_rx_ports_ > 0)
-        {
-            const auto msg_visitor = [&filters](RxSubscription& rx_subscription) {
-                // Make and store a single message filter.
-                const auto flt = ::canardMakeFilterForSubject(rx_subscription.port_id);
-                filters.emplace_back(Filter{flt.extended_can_id, flt.extended_mask});
-            };
-            ports_count += RxSubscriptionTree::visitCounting(subs_trees[CanardTransferKindMessage], msg_visitor);
-        }
-
-        // No need to make service filters if we don't have a local node ID.
-        //
-        if ((total_svc_rx_ports_ > 0) && (!is_anonymous))
-        {
-            const auto svc_visitor = [&filters, local_node_id](RxSubscription& rx_subscription) {
-                // Make and store a single service filter.
-                const auto flt = ::canardMakeFilterForService(rx_subscription.port_id, local_node_id);
-                filters.emplace_back(Filter{flt.extended_can_id, flt.extended_mask});
-            };
-            ports_count += RxSubscriptionTree::visitCounting(subs_trees[CanardTransferKindRequest], svc_visitor);
-            ports_count += RxSubscriptionTree::visitCounting(subs_trees[CanardTransferKindResponse], svc_visitor);
-        }
-
-        (void) ports_count;
-        CETL_DEBUG_ASSERT(ports_count == total_active_ports, "");
-        return true;
-    }
-
-    void cancelRxCallbacksIfNoPortsLeft()
-    {
-        if (0 == (total_msg_rx_ports_ + total_svc_rx_ports_))
+        const auto& subs_stats = getSubscriptionStats();
+        if (0 == (subs_stats.total_msg_rx_ports + subs_stats.total_svc_rx_ports))
         {
             for (Media& media : media_array_)
             {
@@ -787,12 +758,11 @@ private:
 
     // MARK: Data members:
 
-    IExecutor&            executor_;
-    MediaArray            media_array_;
-    std::size_t           total_msg_rx_ports_;
-    std::size_t           total_svc_rx_ports_;
-    TransientErrorHandler transient_error_handler_;
-    Callback::Any         configure_filters_callback_;
+    IExecutor&                               executor_;
+    MediaArray                               media_array_;
+    TransientErrorHandler                    transient_error_handler_;
+    Callback::Any                            configure_filters_callback_;
+    SessionTree<RxSessionTreeNode::Response> svc_response_rx_session_nodes_;
 
 };  // TransportImpl
 

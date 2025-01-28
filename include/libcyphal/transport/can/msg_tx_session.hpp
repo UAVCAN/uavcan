@@ -42,15 +42,17 @@ class MessageTxSession final : public IMessageTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IMessageTxSession>, AnyFailure> make(TransportDelegate&     delegate,
-                                                                                  const MessageTxParams& params)
+    CETL_NODISCARD static Expected<UniquePtr<IMessageTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const MessageTxParams&      params)
     {
         if (params.subject_id > CANARD_SUBJECT_ID_MAX)
         {
             return ArgumentError{};
         }
 
-        auto session = libcyphal::detail::makeUniquePtr<Spec>(delegate.memory(), Spec{}, delegate, params);
+        auto session = libcyphal::detail::makeUniquePtr<Spec>(memory, Spec{}, delegate, params);
         if (session == nullptr)
         {
             return MemoryError{};

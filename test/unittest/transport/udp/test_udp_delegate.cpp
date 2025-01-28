@@ -10,6 +10,7 @@
 #include <cetl/pf17/cetlpf.hpp>
 #include <libcyphal/errors.hpp>
 #include <libcyphal/transport/errors.hpp>
+#include <libcyphal/transport/svc_sessions.hpp>
 #include <libcyphal/transport/types.hpp>
 #include <libcyphal/transport/udp/delegate.hpp>
 #include <libcyphal/types.hpp>
@@ -53,10 +54,13 @@ using testing::VariantWith;
 class TestUdpDelegate : public testing::Test
 {
 protected:
-    class TransportDelegateImpl final : public detail::TransportDelegate
+    using UdpardMemory      = udp::detail::UdpardMemory;
+    using MemoryResources   = udp::detail::MemoryResources;
+    using TransportDelegate = udp::detail::TransportDelegate;
+
+    class TransportDelegateImpl final : public TransportDelegate
     {
     public:
-        using TransportDelegate::MemoryResources;
         using TransportDelegate::memoryResources;
         using TransportDelegate::makeUdpardMemoryDeleter;
         using TransportDelegate::makeUdpardMemoryResource;
@@ -79,7 +83,12 @@ protected:
                      const PayloadFragments                           payload_fragments),
                     (override));
 
-        MOCK_METHOD(void, onSessionEvent, (const SessionEvent::Variant& event_var), (override));
+        MOCK_METHOD(void, onSessionEvent, (const SessionEvent::Variant& event_var), (noexcept, override));  // NOLINT
+
+        MOCK_METHOD(udp::detail::IRxSessionDelegate*,
+                    tryFindRxSessionDelegateFor,
+                    (const ResponseRxParams& params),
+                    (override));
 
     };  // TransportDelegateImpl
 
@@ -108,7 +117,7 @@ protected:
     UdpardFragment* allocateNewUdpardFragment(const std::size_t size)
     {
         // This structure mimics internal Udpard `RxFragment` layout.
-        // We need this to know its size, so that test tear down can check if all memory was deallocated.
+        // We need this to know its size, so that test teardown can check if all memory was deallocated.
         // @see `EXPECT_THAT(fragment_mr_.total_allocated_bytes, fragment_mr_.total_deallocated_bytes);`
         //
         struct RxFragment
@@ -141,9 +150,7 @@ protected:
 
 TEST_F(TestUdpDelegate, UdpardMemory_copy)
 {
-    using UdpardMemory = udp::detail::TransportDelegate::UdpardMemory;
-
-    TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
+    const TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
 
     auto* const payload = allocateNewUdpardPayload(4);
     fillIotaBytes({payload, 4}, b('0'));
@@ -153,12 +160,18 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy)
     rx_transfer.payload_size = payload_size;
     rx_transfer.payload      = UdpardFragment{nullptr, {payload_size, payload}, {payload_size, payload}};
 
-    const UdpardMemory udpard_memory{delegate, rx_transfer};
+    const UdpardMemory udpard_memory{delegate.memoryResources(), rx_transfer};
     EXPECT_THAT(udpard_memory.size(), payload_size);
+    EXPECT_THAT(rx_transfer.payload_size, 0);
+    EXPECT_THAT(rx_transfer.payload.next, nullptr);
+    EXPECT_THAT(rx_transfer.payload.view.size, 0);
+    EXPECT_THAT(rx_transfer.payload.view.data, nullptr);
+    EXPECT_THAT(rx_transfer.payload.origin.size, 0);
+    EXPECT_THAT(rx_transfer.payload.origin.data, nullptr);
 
     // Ask exactly as payload
     {
-        const std::size_t          ask_size = payload_size;
+        constexpr std::size_t      ask_size = payload_size;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -167,7 +180,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy)
 
     // Ask more than payload
     {
-        const std::size_t          ask_size = payload_size + 2;
+        constexpr std::size_t      ask_size = payload_size + 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), payload_size);
@@ -176,7 +189,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy)
 
     // Ask less than payload (with different offsets)
     {
-        const std::size_t          ask_size = payload_size - 2;
+        constexpr std::size_t      ask_size = payload_size - 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -202,9 +215,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy)
 
 TEST_F(TestUdpDelegate, UdpardMemory_copy_on_moved)
 {
-    using UdpardMemory = udp::detail::TransportDelegate::UdpardMemory;
-
-    TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
+    const TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
 
     constexpr std::size_t payload_size = 4;
     auto* const           payload      = allocateNewUdpardPayload(payload_size);
@@ -214,7 +225,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_on_moved)
     rx_transfer.payload_size = payload_size;
     rx_transfer.payload      = UdpardFragment{nullptr, {payload_size, payload}, {payload_size, payload}};
 
-    UdpardMemory old_udpard_memory{delegate, rx_transfer};
+    UdpardMemory old_udpard_memory{delegate.memoryResources(), rx_transfer};
     EXPECT_THAT(old_udpard_memory.size(), payload_size);
 
     const UdpardMemory new_udpard_memory{std::move(old_udpard_memory)};
@@ -230,7 +241,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_on_moved)
         EXPECT_THAT(buffer, Each(b('\0')));
     }
 
-    // Try new one
+    // Try a new one
     {
         std::array<byte, payload_size> buffer{};
         EXPECT_THAT(new_udpard_memory.copy(0, buffer.data(), buffer.size()), payload_size);
@@ -240,9 +251,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_on_moved)
 
 TEST_F(TestUdpDelegate, UdpardMemory_copy_multi_fragmented)
 {
-    using UdpardMemory = udp::detail::TransportDelegate::UdpardMemory;
-
-    TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
+    const TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
 
     auto* const payload0 = allocateNewUdpardPayload(7);
 
@@ -257,18 +266,18 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_multi_fragmented)
     fillIotaBytes({payload1, 8}, b('A'));
     fillIotaBytes({payload2, 9}, b('a'));
 
-    const std::size_t payload_size       = 3 + 4 + 2;
+    constexpr std::size_t payload_size   = 3 + 4 + 2;
     rx_transfer.payload_size             = payload_size;
     rx_transfer.payload.view             = {3, payload0 + 2};
     rx_transfer.payload.next->view       = {4, payload1 + 1};
     rx_transfer.payload.next->next->view = {2, payload2 + 3};
 
-    const UdpardMemory udpard_memory{delegate, rx_transfer};
+    const UdpardMemory udpard_memory{delegate.memoryResources(), rx_transfer};
     EXPECT_THAT(udpard_memory.size(), payload_size);
 
     // Ask exactly as payload
     {
-        const std::size_t          ask_size = payload_size;
+        constexpr std::size_t      ask_size = payload_size;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -277,7 +286,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_multi_fragmented)
 
     // Ask more than payload
     {
-        const std::size_t          ask_size = payload_size + 2;
+        constexpr std::size_t      ask_size = payload_size + 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), payload_size);
@@ -287,7 +296,7 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_multi_fragmented)
 
     // Ask less than payload (with different offsets)
     {
-        const std::size_t          ask_size = payload_size - 2;
+        constexpr std::size_t      ask_size = payload_size - 2;
         std::array<byte, ask_size> buffer{};
 
         EXPECT_THAT(udpard_memory.copy(0, buffer.data(), ask_size), ask_size);
@@ -316,15 +325,13 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_multi_fragmented)
 
 TEST_F(TestUdpDelegate, UdpardMemory_copy_empty)
 {
-    using UdpardMemory = udp::detail::TransportDelegate::UdpardMemory;
-
-    TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
+    const TransportDelegateImpl delegate{general_mr_, &fragment_mr_, &payload_mr_};
 
     UdpardRxTransfer rx_transfer{};
     rx_transfer.payload_size = 0;
     rx_transfer.payload      = UdpardFragment{nullptr, {0, nullptr}, {0, nullptr}};
 
-    const UdpardMemory udpard_memory{delegate, rx_transfer};
+    const UdpardMemory udpard_memory{delegate.memoryResources(), rx_transfer};
     EXPECT_THAT(udpard_memory.size(), 0);
 
     std::array<byte, 3> buffer{};
@@ -335,21 +342,21 @@ TEST_F(TestUdpDelegate, UdpardMemory_copy_empty)
 
 TEST_F(TestUdpDelegate, optAnyFailureFromUdpard)
 {
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_MEMORY),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_MEMORY),
                 Optional(VariantWith<MemoryError>(_)));
 
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_ARGUMENT),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_ARGUMENT),
                 Optional(VariantWith<libcyphal::ArgumentError>(_)));
 
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_CAPACITY),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_CAPACITY),
                 Optional(VariantWith<CapacityError>(_)));
 
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_ANONYMOUS),
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(-UDPARD_ERROR_ANONYMOUS),
                 Optional(VariantWith<AnonymousError>(_)));
 
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(0), Eq(cetl::nullopt));
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(1), Eq(cetl::nullopt));
-    EXPECT_THAT(udp::detail::TransportDelegate::optAnyFailureFromUdpard(-1), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(0), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(1), Eq(cetl::nullopt));
+    EXPECT_THAT(TransportDelegate::optAnyFailureFromUdpard(-1), Eq(cetl::nullopt));
 }
 
 TEST_F(TestUdpDelegate, makeUdpardMemoryResource)

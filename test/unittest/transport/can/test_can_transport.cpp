@@ -468,6 +468,10 @@ TEST_F(TestCanTransport, makeResponseRxSession_invalid_resubscription)
 
         EXPECT_CALL(media_mock_, setFilters(IsEmpty()))  //
             .WillOnce([&](Filters) { return cetl::nullopt; });
+
+        // Different remote node id 0x32!
+        auto maybe_rx_session3 = transport->makeResponseRxSession({0, test_subject_id, 0x32});
+        ASSERT_THAT(maybe_rx_session3, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
     });
     scheduler_.spinFor(10s);
 }

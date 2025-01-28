@@ -46,9 +46,10 @@ class SvcRequestTxSession final : public IRequestTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IRequestTxSession>, AnyFailure> make(cetl::pmr::memory_resource& memory,
-                                                                                  TransportDelegate&          delegate,
-                                                                                  const RequestTxParams&      params)
+    CETL_NODISCARD static Expected<UniquePtr<IRequestTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const RequestTxParams&      params)
     {
         if ((params.service_id > UDPARD_SERVICE_ID_MAX) || (params.server_node_id > UDPARD_NODE_ID_MAX))
         {
@@ -125,9 +126,10 @@ class SvcResponseTxSession final : public IResponseTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IResponseTxSession>, AnyFailure> make(cetl::pmr::memory_resource& memory,
-                                                                                   TransportDelegate&          delegate,
-                                                                                   const ResponseTxParams&     params)
+    CETL_NODISCARD static Expected<UniquePtr<IResponseTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const ResponseTxParams&     params)
     {
         if (params.service_id > UDPARD_SERVICE_ID_MAX)
         {

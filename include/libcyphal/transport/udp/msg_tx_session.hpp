@@ -44,9 +44,10 @@ class MessageTxSession final : public IMessageTxSession
     };
 
 public:
-    CETL_NODISCARD static Expected<UniquePtr<IMessageTxSession>, AnyFailure> make(cetl::pmr::memory_resource& memory,
-                                                                                  TransportDelegate&          delegate,
-                                                                                  const MessageTxParams&      params)
+    CETL_NODISCARD static Expected<UniquePtr<IMessageTxSession>, AnyFailure> make(  //
+        cetl::pmr::memory_resource& memory,
+        TransportDelegate&          delegate,
+        const MessageTxParams&      params)
     {
         if (params.subject_id > UDPARD_SUBJECT_ID_MAX)
         {

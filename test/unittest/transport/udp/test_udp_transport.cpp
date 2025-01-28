@@ -458,6 +458,10 @@ TEST_F(TestUpdTransport, makeResponseRxSession_invalid_resubscription)
         //
         auto maybe_rx_session2 = transport->makeResponseRxSession({0, test_subject_id, 0x31});
         ASSERT_THAT(maybe_rx_session2, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
+
+        // Different remote node id 0x32!
+        auto maybe_rx_session3 = transport->makeResponseRxSession({0, test_subject_id, 0x32});
+        ASSERT_THAT(maybe_rx_session3, VariantWith<UniquePtr<IResponseRxSession>>(NotNull()));
     });
     scheduler_.scheduleAt(9s, [&](const auto&) {
         //

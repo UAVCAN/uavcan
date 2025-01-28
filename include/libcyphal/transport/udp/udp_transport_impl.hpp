@@ -10,7 +10,7 @@
 #include "media.hpp"
 #include "msg_rx_session.hpp"
 #include "msg_tx_session.hpp"
-#include "session_tree.hpp"
+#include "rx_session_tree_node.hpp"
 #include "svc_rx_sessions.hpp"
 #include "svc_tx_sessions.hpp"
 #include "tx_rx_sockets.hpp"
@@ -21,6 +21,7 @@
 #include "libcyphal/transport/errors.hpp"
 #include "libcyphal/transport/lizard_helpers.hpp"
 #include "libcyphal/transport/msg_sessions.hpp"
+#include "libcyphal/transport/session_tree.hpp"
 #include "libcyphal/transport/svc_sessions.hpp"
 #include "libcyphal/transport/types.hpp"
 #include "libcyphal/types.hpp"
@@ -275,7 +276,7 @@ private:
     CETL_NODISCARD Expected<UniquePtr<IMessageRxSession>, AnyFailure> makeMessageRxSession(
         const MessageRxParams& params) override
     {
-        return makeMsgRxSession(params, msg_rx_session_nodes_);
+        return makeMsgRxSessionImpl(params, msg_rx_session_nodes_);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IMessageTxSession>, AnyFailure> makeMessageTxSession(
@@ -293,9 +294,9 @@ private:
     CETL_NODISCARD Expected<UniquePtr<IRequestRxSession>, AnyFailure> makeRequestRxSession(
         const RequestRxParams& params) override
     {
-        return makeSvcRxSession<IRequestRxSession, SvcRequestRxSession>(params.service_id,
-                                                                        params,
-                                                                        svc_request_rx_session_nodes_);
+        return makeSvcRxSessionImpl<IRequestRxSession, SvcRequestRxSession>(  //
+            params,
+            svc_request_rx_session_nodes_);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IRequestTxSession>, AnyFailure> makeRequestTxSession(
@@ -313,9 +314,9 @@ private:
     CETL_NODISCARD Expected<UniquePtr<IResponseRxSession>, AnyFailure> makeResponseRxSession(
         const ResponseRxParams& params) override
     {
-        return makeSvcRxSession<IResponseRxSession, SvcResponseRxSession>(params.service_id,
-                                                                          params,
-                                                                          svc_response_rx_session_nodes_);
+        return makeSvcRxSessionImpl<IResponseRxSession, SvcResponseRxSession>(  //
+            params,
+            svc_response_rx_session_nodes_);
     }
 
     CETL_NODISCARD Expected<UniquePtr<IResponseTxSession>, AnyFailure> makeResponseTxSession(
@@ -384,30 +385,48 @@ private:
         return cetl::nullopt;
     }
 
-    void onSessionEvent(const SessionEvent::Variant& event_var) override
+    void onSessionEvent(const SessionEvent::Variant& event_var) noexcept override
     {
-        cetl::visit(cetl::make_overloaded(
-                        [this](const SessionEvent::MsgDestroyed& msg_session_destroyed) {
-                            //
-                            msg_rx_session_nodes_.removeNodeFor(msg_session_destroyed.subject_id);
-                        },
-                        [this](const SessionEvent::SvcRequestDestroyed& req_session_destroyed) {
-                            //
-                            svc_request_rx_session_nodes_.removeNodeFor(req_session_destroyed.service_id);
-                            cancelRxCallbacksIfNoSvcLeft();
-                        },
-                        [this](const SessionEvent::SvcResponseDestroyed& res_session_destroyed) {
-                            //
-                            svc_response_rx_session_nodes_.removeNodeFor(res_session_destroyed.service_id);
-                            cancelRxCallbacksIfNoSvcLeft();
-                        }),
-                    event_var);
+        // `visit` might hypothetically throw, so we need to catch it.
+        const auto result = libcyphal::detail::performWithoutThrowing([this, &event_var] {
+            //
+            cetl::visit(cetl::make_overloaded(  //
+                            [this](const SessionEvent::MsgDestroyed& msg_session_destroyed) noexcept {
+                                //
+                                msg_rx_session_nodes_.removeNodeFor(msg_session_destroyed.params);
+                            },
+                            [this](const SessionEvent::SvcRequestDestroyed& req_session_destroyed) noexcept {
+                                //
+                                svc_request_rx_session_nodes_.removeNodeFor(req_session_destroyed.params);
+                                cancelRxCallbacksIfNoSvcLeft();
+                            },
+                            [this](const SessionEvent::SvcResponseDestroyed& res_session_destroyed) noexcept {
+                                //
+                                svc_response_rx_session_nodes_.removeNodeFor(res_session_destroyed.params);
+                                cancelRxCallbacksIfNoSvcLeft();
+                            }),
+                        event_var);
+        });
+        (void) result;
+        CETL_DEBUG_ASSERT(result, "");
+    }
+
+    IRxSessionDelegate* tryFindRxSessionDelegateFor(const ResponseRxParams& params) override
+    {
+        if (auto* const node = svc_response_rx_session_nodes_.tryFindNodeFor(params))
+        {
+            return node->delegate();
+        }
+        return nullptr;
     }
 
     // MARK: Privates:
 
     using Self              = TransportImpl;
     using ContiguousPayload = transport::detail::ContiguousPayload;
+
+    template <typename Node>
+    using SessionTree = transport::detail::SessionTree<Node>;
 
     struct TxTransferHandler
     {
@@ -473,21 +492,24 @@ private:
 
     };  // TxTransferHandler
 
-    CETL_NODISCARD auto makeMsgRxSession(const MessageRxParams&                   rx_params,
-                                         SessionTree<RxSessionTreeNode::Message>& tree_nodes)
-        -> Expected<UniquePtr<IMessageRxSession>, AnyFailure>
+    CETL_NODISCARD auto makeMsgRxSessionImpl(  //
+        const MessageRxParams&                   params,
+        SessionTree<RxSessionTreeNode::Message>& tree_nodes) -> Expected<UniquePtr<IMessageRxSession>, AnyFailure>
     {
-        auto node_result = tree_nodes.ensureNewNodeFor(rx_params.subject_id);
+        // Make sure that session is unique per given parameters.
+        // For message sessions, the uniqueness is based on the subject ID.
+        //
+        auto node_result = tree_nodes.ensureNodeFor<true>(params);  // should be new
         if (auto* const failure = cetl::get_if<AnyFailure>(&node_result))
         {
             return std::move(*failure);
         }
-        auto& new_msg_node = cetl::get<RxSessionTreeNode::Message::ReferenceWrapper>(node_result).get();
+        auto& new_msg_node = cetl::get<RxSessionTreeNode::Message::RefWrapper>(node_result).get();
 
-        auto session_result = MessageRxSession::make(memoryResources().general, asDelegate(), rx_params, new_msg_node);
+        auto session_result = MessageRxSession::make(memoryResources().general, asDelegate(), params, new_msg_node);
         if (auto* const failure = cetl::get_if<AnyFailure>(&session_result))
         {
-            tree_nodes.removeNodeFor(rx_params.subject_id);
+            tree_nodes.removeNodeFor(params);
             return std::move(*failure);
         }
 
@@ -517,10 +539,10 @@ private:
         return session_result;
     }
 
-    template <typename Interface, typename Concrete, typename RxParams, typename Tree>
-    CETL_NODISCARD auto makeSvcRxSession(const PortId    port_id,
-                                         const RxParams& rx_params,
-                                         Tree&           tree_nodes) -> Expected<UniquePtr<Interface>, AnyFailure>
+    template <typename Interface, typename Concrete, typename Params, typename Tree>
+    CETL_NODISCARD auto makeSvcRxSessionImpl(  //
+        const Params& params,
+        Tree&         tree_nodes) -> Expected<UniquePtr<Interface>, AnyFailure>
     {
         // Try to create all (per each media) shared RX sockets for services.
         // For now, we're just creating them, without any attempt to use them yet - hence the "do nothing" action.
@@ -541,20 +563,23 @@ private:
             return std::move(media_failure.value());
         }
 
-        // Make sure that session is unique per port.
+        // Make sure that session is unique per given parameters.
+        // For request sessions, the uniqueness is based on the service ID.
+        // For response sessions, the uniqueness is based on the service ID and the server node ID.
         //
-        auto node_result = tree_nodes.ensureNewNodeFor(port_id);
+        auto node_result = tree_nodes.template ensureNodeFor<true>(params);  // should be new
         if (auto* const failure = cetl::get_if<AnyFailure>(&node_result))
         {
             return std::move(*failure);
         }
+        auto& new_svc_node = cetl::get<typename Tree::NodeBase::RefWrapper>(node_result).get();
 
-        auto session_result = Concrete::make(memoryResources().general, asDelegate(), rx_params);
+        auto session_result = Concrete::make(memoryResources().general, asDelegate(), params, new_svc_node);
         if (nullptr != cetl::get_if<AnyFailure>(&session_result))
         {
-            // We failed to create the session, so we need to release the unique port id node.
+            // We failed to create the session, so we need to release the unique node.
             // The sockets we made earlier will be released in the destructor of whole transport.
-            tree_nodes.removeNodeFor(port_id);
+            tree_nodes.removeNodeFor(params);
         }
 
         return session_result;
@@ -922,8 +947,16 @@ private:
 
             // No Sonar `cpp:S5357` b/c the raw `user_reference` is part of libudpard api,
             // and it was set by us at a RX session constructor (see f.e. `MessageRxSession` ctor).
-            auto* const delegate = static_cast<IRxSessionDelegate*>(out_port->user_reference);  // NOSONAR cpp:S5357
-            delegate->acceptRxTransfer(out_transfer.base);
+            auto* const session_delegate =
+                static_cast<IRxSessionDelegate*>(out_port->user_reference);  // NOSONAR cpp:S5357
+
+            const auto transfer_id = out_transfer.base.transfer_id;
+            const auto priority    = static_cast<Priority>(out_transfer.base.priority);
+            const auto timestamp   = TimePoint{std::chrono::microseconds{out_transfer.base.timestamp_usec}};
+
+            session_delegate->acceptRxTransfer(UdpardMemory{memoryResources(), out_transfer.base},
+                                               TransferRxMetadata{{transfer_id, priority}, timestamp},
+                                               out_transfer.base.source_node_id);
         }
     }
 
@@ -973,11 +1006,17 @@ private:
         const auto failure       = tryHandleTransientUdpardResult<SubscriptionReport>(media, result, subscription);
         if ((!failure.has_value()) && (result > 0))
         {
-            session_delegate.acceptRxTransfer(out_transfer);
+            const auto transfer_id = out_transfer.transfer_id;
+            const auto priority    = static_cast<Priority>(out_transfer.priority);
+            const auto timestamp   = TimePoint{std::chrono::microseconds{out_transfer.timestamp_usec}};
+
+            session_delegate.acceptRxTransfer(UdpardMemory{memoryResources(), out_transfer},
+                                              TransferRxMetadata{{transfer_id, priority}, timestamp},
+                                              out_transfer.source_node_id);
         }
     }
 
-    void cancelRxCallbacksIfNoSvcLeft()
+    void cancelRxCallbacksIfNoSvcLeft() noexcept
     {
         if (svc_request_rx_session_nodes_.isEmpty() && svc_response_rx_session_nodes_.isEmpty())
         {
